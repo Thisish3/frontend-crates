@@ -184,9 +184,6 @@ fn splittings(input: &str) -> Vec<(String, Vec<String>)> {
     ]
 }
 
-/// Extra schedules for the chunk-invariance gate: two-part splits (strided to
-/// at most `MAX_TWO_PART` boundaries), marker-aligned pieces coalesced `k` at a
-/// time (several tokens per delta), and seeded multi-part splits.
 fn extended_splittings(input: &str) -> Vec<(String, Vec<String>)> {
     const MAX_TWO_PART: usize = 24;
     const RANDOM_SPLITS: u64 = 4;
