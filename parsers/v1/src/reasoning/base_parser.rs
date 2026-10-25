@@ -1043,8 +1043,6 @@ mod tests {
 
     #[test]
     fn test_force_reasoning_streaming_strips_think_after_prefix_in_one_chunk() {
-        // A coalesced chunk such as "\n<think>..." must strip the tag the same
-        // way token-sized chunks do, instead of streaming it as reasoning text.
         let run = |chunks: &[&str]| {
             let mut parser = BasicReasoningParser::new(
                 "<think>".to_string(),
