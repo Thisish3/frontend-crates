@@ -1095,7 +1095,6 @@ mod tests {
             run(&["\n<thi", "nk>reason</think>answer"]),
             ("\nreason".to_string(), "answer".to_string())
         );
-        // A held-back prefix that never becomes the tag is released as reasoning.
         assert_eq!(
             run(&["\n<thi", "s is reasoning</think>answer"]),
             ("\n<this is reasoning".to_string(), "answer".to_string())
