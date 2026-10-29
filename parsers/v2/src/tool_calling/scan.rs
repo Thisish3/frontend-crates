@@ -1071,6 +1071,10 @@ impl JsonValueBoundary {
         self.quoted.inside
     }
 
+    pub(crate) fn container_closer(&self) -> Option<char> {
+        self.closers.last().copied()
+    }
+
     /// True only on the character completing the first root value. JSON syntax
     /// validation remains with serde; matching bracket types cannot be repaired
     /// by a later suffix, and quoted delimiters never settle a structural boundary.
@@ -1505,7 +1509,7 @@ pub(crate) trait InvokeEmitter {
         tool_index: usize,
     ) -> anyhow::Result<Option<ToolCallDelta>>;
 
-    /// Whether an incomplete structured value may be held until a later invoke
+    /// Whether a malformed invocation may be held until a later invoke
     /// either recovers the stream or EOF confirms that the malformed call is final.
     fn defer_parse_error(&self, _invoke: &str, _error: &anyhow::Error) -> bool {
         false
@@ -2033,6 +2037,8 @@ pub(crate) struct WrappedBlockScanner<E: InvokeEmitter> {
     header_slot: bool,
     policy: ToolCallPolicy,
     finish_at_eos: bool,
+    #[cfg(test)]
+    block_end_searched_bytes: usize,
 }
 
 struct DeferredParseError {
@@ -2075,6 +2081,8 @@ impl<E: InvokeEmitter> WrappedBlockScanner<E> {
             header_slot: true,
             policy: ToolCallPolicy::default(),
             finish_at_eos: false,
+            #[cfg(test)]
+            block_end_searched_bytes: 0,
         }
     }
 
@@ -2362,7 +2370,7 @@ impl<E: InvokeEmitter> WrappedBlockScanner<E> {
                         why = %format!("{}_incomplete_invoke_recovered", self.spec.family),
                         tool_index = deferred.tool_index,
                         dropped_bytes = deferred.bytes,
-                        "Dropped an incomplete invoke after a later call parsed successfully"
+                        "Dropped a malformed invoke after a later call parsed successfully"
                     );
                 }
                 Ok(Some(deltas))
@@ -2432,6 +2440,27 @@ impl<E: InvokeEmitter> WrappedBlockScanner<E> {
         } else {
             self.find_invoke_start(&self.buffer)
         }
+    }
+
+    /// The first block end that can close the open block: one at or before the active
+    /// invoke's start, or any block end when no invoke has started. A block end after
+    /// the invoke start is argument data, so the search stops there instead of
+    /// rescanning the invoke's growing arguments on every push.
+    fn closing_block_end(&mut self, invoke_start: Option<usize>) -> Option<(usize, usize)> {
+        let limit = match invoke_start {
+            None => self.buffer.len(),
+            Some(start) => {
+                let longest = self.spec.block_ends.iter().map(String::len).max()?;
+                let from = (start + longest).min(self.buffer.len());
+                (from..=self.buffer.len()).find(|&i| self.buffer.is_char_boundary(i))?
+            }
+        };
+        #[cfg(test)]
+        {
+            self.block_end_searched_bytes += limit;
+        }
+        find_first(&self.buffer[..limit], &self.spec.block_ends)
+            .filter(|&(pos, _)| invoke_start.is_none_or(|start| pos <= start))
     }
 
     /// Offset just past the closer of the invoke beginning at byte zero.
@@ -3320,23 +3349,19 @@ impl<E: InvokeEmitter> WrappedBlockScanner<E> {
 
                 // Close the block once no more complete invokes precede its end.
                 if !self.block_is_invoke()
-                    && let Some((end_pos, end_len)) =
-                        find_first(&self.buffer, &self.spec.block_ends)
+                    && let Some((end_pos, end_len)) = self.closing_block_end(invoke_start)
                 {
-                    let invoke_before_end = invoke_start.is_some_and(|start| start < end_pos);
-                    if !invoke_before_end {
-                        // Complete block fully closed: drop its markup and resume
-                        // keeping natural text (inter-block / trailing). Any later
-                        // block re-enters `in_block` and re-suppresses its markup.
-                        // Matches the v1 batch parsers (cases 8.b/8.c/8.d).
-                        self.consume_buffer_prefix(end_pos + end_len);
-                        self.reset_invoke_boundary();
-                        self.clear_uncommitted_block();
-                        self.in_block = false;
-                        self.suppress_normal_text = false;
-                        self.in_reasoning = std::mem::take(&mut self.resume_reasoning);
-                        continue;
-                    }
+                    // Complete block fully closed: drop its markup and resume
+                    // keeping natural text (inter-block / trailing). Any later
+                    // block re-enters `in_block` and re-suppresses its markup.
+                    // Matches the v1 batch parsers (cases 8.b/8.c/8.d).
+                    self.consume_buffer_prefix(end_pos + end_len);
+                    self.reset_invoke_boundary();
+                    self.clear_uncommitted_block();
+                    self.in_block = false;
+                    self.suppress_normal_text = false;
+                    self.in_reasoning = std::mem::take(&mut self.resume_reasoning);
+                    continue;
                 }
 
                 let Some(start) = invoke_start else {
@@ -3742,6 +3767,44 @@ mod recovery_tests {
 mod tests {
     use super::test_support::failing_scanner;
     use super::*;
+
+    #[test]
+    fn open_invoke_block_end_search_is_linear() {
+        let tools = [crate::tool_calling::traits::Tool {
+            name: "create_file".to_string(),
+            description: None,
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": { "content": { "type": "string" } }
+            }),
+            strict: None,
+        }];
+        let mut scanner = crate::tool_calling::qwen3_coder::qwen3_scanner(&tools);
+        let content = format!("keep </tool_call> as data {}", "x".repeat(8192));
+        let input = format!(
+            "<tool_call>\n<function=create_file>\n<parameter=content>{content}</parameter>\n</function>\n</tool_call>"
+        );
+        let mut events = Vec::new();
+        for (at, ch) in input.char_indices() {
+            events.extend(
+                scanner
+                    .push_ordered(&input[at..at + ch.len_utf8()])
+                    .unwrap(),
+            );
+        }
+        events.extend(scanner.finish_ordered().unwrap());
+        let arguments = crate::unified::tool_arguments_raw(&events);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&arguments[&0]).unwrap(),
+            serde_json::json!({ "content": content })
+        );
+        assert!(
+            scanner.block_end_searched_bytes <= 32 * input.len(),
+            "searched {} bytes for {} input bytes",
+            scanner.block_end_searched_bytes,
+            input.len()
+        );
+    }
 
     #[test]
     fn speculative_prose_quote_tail_advances_once_and_clear_releases_state() {

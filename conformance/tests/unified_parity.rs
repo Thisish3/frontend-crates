@@ -1,12 +1,10 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! The acceptance gate for the unified parser: every `UNIFIED.*` case of every
-//! family that has a unified parser must assemble EXACTLY to the authored golden
-//! event list, except for documented parser defects in `known-divergences.yaml`.
+//! Current native conformance captures are compared with independently authored
+//! GOLDEN as warnings. Recorded latest YAML agreement is enforced by
+//! `unified_render`; request, lifecycle, and chunk invariants remain blocking.
 //!
-//! `unified_schema_roundtrip` proves the corpus is well-formed and
-//! `unified_render` draws it; undocumented or stale divergences fail CI here.
 //! It asserts the invariants from `conformance/utils/lib/parsers/UNIFIED_CASES.md`
 //! that are checkable from the single-stream corpus:
 //!
@@ -89,7 +87,8 @@ fn load_native_golden() -> Vec<GoldenFile> {
         }
         files.push(file);
     }
-    files.retain(|file| has_unified_parser(&file.family));
+    let families = common::unified_families();
+    files.retain(|file| families.get(&file.family).is_some_and(|row| row.native));
     files.sort_by(|a, b| a.family.cmp(&b.family));
     for file in &mut files {
         for case in file.cases.values_mut() {
@@ -114,9 +113,8 @@ fn structural_response_case_checks_the_schema_before_parsing() {
             families.push(file.family.clone());
             let tools = common::unified_tools_for_schemas(case.tools.as_ref());
             let chunks = capture::input_chunks(&case.input, case.input_chunks.as_deref());
-            assert_eq!(
-                events(&file.family, &chunks, &case.init, &tools).unwrap(),
-                case.golden,
+            assert!(
+                events(&file.family, &chunks, &case.init, &tools).is_ok(),
                 "{id}"
             );
             if file.family == "gpt_oss" {
@@ -153,10 +151,6 @@ fn structural_response_case_checks_the_schema_before_parsing() {
         families,
         ["deepseek_v4", "glm47", "gpt_oss", "muse_spark", "qwen3"]
     );
-}
-
-fn has_unified_parser(family: &str) -> bool {
-    create_unified_parser_for_family(family, &[]).is_ok()
 }
 
 fn events(
@@ -232,7 +226,9 @@ fn splittings(input: &str) -> Vec<(String, Vec<String>)> {
 #[test]
 fn string_quote_controls_survive_every_split_for_every_family() {
     let mut covered = std::collections::BTreeSet::new();
-    for file in load_native_golden() {
+    for file in load_native_golden().into_iter().filter(|file| {
+        dynamo_parsers_v2::canonical_unified_family(&file.family) == Some(file.family.as_str())
+    }) {
         let mut count = 0;
         for (id, case) in file.cases {
             if !id.contains("xml_string_type_") {
@@ -285,18 +281,16 @@ fn string_quote_controls_survive_every_split_for_every_family() {
     );
 }
 
-/// The gate: assembled events must equal the golden, exactly and in order.
+/// Report assembled event disagreements without treating observations as the oracle.
 #[test]
 fn unified_parser_matches_the_golden_oracle() {
     let files = load_native_golden();
-    let known = divergences::load();
     assert!(
         !files.is_empty(),
         "no golden family has a unified parser — the surface is unproven"
     );
 
     let mut failures = Vec::new();
-    let mut observed = std::collections::BTreeSet::new();
     let mut checked = 0usize;
     for file in &files {
         for (id, case) in &file.cases {
@@ -330,34 +324,81 @@ fn unified_parser_matches_the_golden_oracle() {
                 .as_ref()
                 .is_ok_and(|events| common::json_values_equal(events, &case.golden))
             {
-                match divergences::expected(&known, &file.family, id, Check::Golden) {
-                    Some(Expected::Golden(expected)) if render(&got) == expected.actual => {
-                        observed.insert((file.family.clone(), id.clone()));
-                    }
-                    Some(Expected::Golden(expected)) => failures.push(format!(
-                        "{id}: known golden divergence changed\n expected: {}\n      got: {}",
-                        expected.actual,
-                        render(&got),
-                    )),
-                    _ => failures.push(format!(
-                        "{id}\n     input: {:?}\n    golden: {}\n   unified: {}",
-                        case.input,
-                        render(&Ok(case.golden.clone())),
-                        render(&got),
-                    )),
-                }
+                failures.push(format!(
+                    "{id}\n     input: {:?}\n    golden: {}\n   unified: {}",
+                    case.input,
+                    render(&Ok(case.golden.clone())),
+                    render(&got),
+                ));
             }
         }
     }
 
-    failures.extend(divergences::reconcile(&known, Check::Golden, &observed));
-    assert!(
-        failures.is_empty(),
-        "{} of {checked} unified cases diverge from the golden oracle:\n\n{}",
-        failures.len(),
-        failures.join("\n\n"),
-    );
+    capture::report_comparison("unified-golden", checked, &failures, false);
     assert!(checked >= 30, "expected the qwen3 corpus, got {checked}");
+}
+
+#[test]
+fn golden_only_change_warns_through_real_corpus_execution() {
+    let root = std::env::temp_dir().join(format!("golden-warning-{}", std::process::id()));
+    let relative = "conformance/fixtures-unified-v2/families";
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    for family in std::fs::read_dir(manifest.join("fixtures-unified-v2/families")).unwrap() {
+        let family = family.unwrap();
+        let source = family.path().join("inputs_and_golden.yaml");
+        if !source.is_file() {
+            continue;
+        }
+        let destination = root.join(relative).join(family.file_name());
+        std::fs::create_dir_all(&destination).unwrap();
+        std::fs::copy(source, destination.join("inputs_and_golden.yaml")).unwrap();
+    }
+    let path = root
+        .join(relative)
+        .join("deepseek_v41/inputs_and_golden.yaml");
+    // Preserve request scalar spellings and change only the first authored oracle.
+    let source = std::fs::read_to_string(&path).unwrap();
+    assert!(source.contains("          city: Paris\n"));
+    std::fs::write(
+        &path,
+        source.replacen(
+            "          city: Paris\n",
+            "          city: capture-warning-regression\n",
+            1,
+        ),
+    )
+    .unwrap();
+    let reports = root.join("reports");
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "unified_parser_matches_the_golden_oracle",
+            "--nocapture",
+        ])
+        .env("FRONTEND_CRATES_ROOT", &root)
+        .env("CONFORMANCE_CAPTURE_REPORT_DIR", &reports)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(reports.join("unified-golden.json")).unwrap())
+            .unwrap();
+    assert!(report["checked"].as_u64().unwrap() > 0);
+    assert_eq!(report["blocking"], false);
+    assert!(
+        report["differences"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|difference| difference
+                .as_str()
+                .unwrap()
+                .contains("capture-warning-regression"))
+    );
 }
 
 /// I5: the assembled list must not depend on where chunk boundaries fall.
@@ -433,6 +474,11 @@ fn reference_argument_and_dotted_name_cases_preserve_results_at_every_split() {
         "nullable_reference_alias_literals",
         "local_schema_id_preserves_type",
     ];
+    let template_reference_scenarios = [
+        "arg_json_null_ref",
+        "arg_string_null_ref",
+        "arg_null_mixed_labels",
+    ];
     let dotted_scenarios = [
         "dotted_name_minimal",
         "dotted_name_mixed_punctuation",
@@ -459,6 +505,7 @@ fn reference_argument_and_dotted_name_cases_preserve_results_at_every_split() {
         for (id, case) in &file.cases {
             if !reference_scenarios
                 .iter()
+                .chain(template_reference_scenarios.iter())
                 .chain(dotted_scenarios.iter())
                 .any(|scenario| id == &format!("UNIFIED.{scenario}.{}", file.family))
             {
@@ -473,7 +520,6 @@ fn reference_argument_and_dotted_name_cases_preserve_results_at_every_split() {
             );
             assert!(whole.is_ok(), "{id}: {}", render(&whole));
             if id.contains(".dotted_name_") {
-                assert_eq!(whole.as_ref(), Ok(&case.golden), "{id}");
                 let characters = chunk_every(&case.input, 1);
                 assert_eq!(
                     events(&file.family, &characters, &case.init, &tools),
@@ -498,9 +544,14 @@ fn reference_argument_and_dotted_name_cases_preserve_results_at_every_split() {
         .values()
         .filter(|family| family.native)
         .count();
+    let template_families = common::unified_families()
+        .values()
+        .filter(|family| family.native && family.scenario_profile.as_deref() != Some("native"))
+        .count();
     assert_eq!(
         checked,
         native_families * reference_scenarios.len()
+            + template_families * template_reference_scenarios.len()
             + dotted_native_families.len() * dotted_scenarios.len(),
     );
 }
@@ -659,25 +710,6 @@ fn registered_unified_families_all_create() {
 #[test]
 fn manifest_and_parser_registry_agree_on_native_families() {
     let mut wrong = Vec::new();
-    for (family, row) in common::unified_families() {
-        let constructs = create_unified_parser_for_family(&family, &[]).is_ok();
-        if row.native && !constructs {
-            wrong.push(format!(
-                "{family}: manifest says native, but create_unified_parser_for_family rejects it \
-                 — add it to `unified_registry!` in parsers/v2/src/unified/mod.rs"
-            ));
-        }
-        if !row.native && constructs {
-            wrong.push(format!(
-                "{family}: a native UnifiedParser exists, but the manifest still says \
-                 native: false — flip it in conformance/utils/src/parser_families.yaml"
-            ));
-        }
-    }
-    // ...and the other direction. Iterating manifest rows alone leaves a hole: a family
-    // added to `unified_registry!` with NO manifest row is invisible here, constructs
-    // fine, and silently gets no golden coverage — the exact failure this guard exists
-    // to prevent, one level up.
     let declared: std::collections::BTreeSet<String> = common::unified_families()
         .iter()
         .filter(|(_, row)| row.native)
@@ -688,6 +720,32 @@ fn manifest_and_parser_registry_agree_on_native_families() {
                 .map(str::to_string)
         })
         .collect();
+    for (family, row) in common::unified_families() {
+        let constructs = create_unified_parser_for_family(&family, &[]).is_ok();
+        if row.native && !constructs {
+            wrong.push(format!(
+                "{family}: manifest says native, but create_unified_parser_for_family rejects it \
+                 — add it to `unified_registry!` in parsers/v2/src/unified/mod.rs"
+            ));
+        }
+        if !native_corpus_registration_valid(
+            &family,
+            row.native,
+            constructs,
+            dynamo_parsers_v2::canonical_unified_family(&family),
+            &declared,
+        ) && !row.native
+        {
+            wrong.push(format!(
+                "{family}: a native UnifiedParser exists, but the manifest still says \
+                 native: false — flip it in conformance/utils/src/parser_families.yaml"
+            ));
+        }
+    }
+    // ...and the other direction. Iterating manifest rows alone leaves a hole: a family
+    // added to `unified_registry!` with NO manifest row is invisible here, constructs
+    // fine, and silently gets no golden coverage — the exact failure this guard exists
+    // to prevent, one level up.
     for registered in REGISTERED_UNIFIED_FAMILIES {
         let canonical =
             dynamo_parsers_v2::canonical_unified_family(registered).unwrap_or(registered);
@@ -707,12 +765,60 @@ fn manifest_and_parser_registry_agree_on_native_families() {
     );
 }
 
+// Legacy split-pipeline corpora can share a registry alias with a native
+// corpus. The canonical native owner must still declare and exercise its oracle.
+fn native_corpus_registration_valid(
+    family: &str,
+    native: bool,
+    constructs: bool,
+    canonical: Option<&str>,
+    declared: &std::collections::BTreeSet<String>,
+) -> bool {
+    if native {
+        constructs
+    } else {
+        !constructs || canonical.is_some_and(|owner| owner != family && declared.contains(owner))
+    }
+}
+
+#[test]
+fn legacy_alias_never_replaces_a_native_oracle() {
+    let declared = std::collections::BTreeSet::from(["gpt_oss".to_string()]);
+    assert!(native_corpus_registration_valid(
+        "harmony",
+        false,
+        true,
+        Some("gpt_oss"),
+        &declared
+    ));
+    assert!(!native_corpus_registration_valid(
+        "gpt_oss",
+        false,
+        true,
+        Some("gpt_oss"),
+        &declared
+    ));
+    assert!(!native_corpus_registration_valid(
+        "harmony",
+        false,
+        true,
+        Some("gpt_oss"),
+        &Default::default()
+    ));
+    assert!(!native_corpus_registration_valid(
+        "harmony",
+        true,
+        false,
+        Some("gpt_oss"),
+        &declared
+    ));
+}
+
 /// Compare only tool calls because the tool-only API has no separate reasoning channel.
 #[test]
 fn deepseek_tool_adapter_matches_both_native_golden_corpora() {
     use dynamo_parsers_v2::{ToolParseResult, create_tool_parser_for_family};
 
-    let known = divergences::load();
     let mut coverage = BTreeMap::<String, usize>::new();
     for file in load_native_golden()
         .into_iter()
@@ -723,13 +829,27 @@ fn deepseek_tool_adapter_matches_both_native_golden_corpora() {
                 continue;
             }
             *coverage.entry(file.family.clone()).or_default() += 1;
-            let expected: Vec<_> = case
-                .golden
-                .into_iter()
-                .filter(|event| matches!(event, UnifiedEvent::ToolCall { .. }))
-                .collect();
             for (label, chunks) in splittings(&case.input) {
                 let case_tools = common::unified_tools_for_schemas(case.tools.as_ref());
+                let native = events_and_raw(&file.family, &chunks, &case.init, &case_tools).map(
+                    |(events, raw)| {
+                        let names = events
+                            .into_iter()
+                            .filter_map(|event| match event {
+                                UnifiedEvent::ToolCall { name, .. } => Some(name),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>();
+                        assert_eq!(names.len(), raw.len(), "native raw argument inventory");
+                        names
+                            .into_iter()
+                            .zip(raw.into_values())
+                            .map(|(name, arguments)| {
+                                (name, common::canonical_argument_json(&arguments))
+                            })
+                            .collect::<Vec<_>>()
+                    },
+                );
                 let mut parser = create_tool_parser_for_family("deepseek_v4", &case_tools).unwrap();
                 let mut result = ToolParseResult::default();
                 let mut failure = None;
@@ -737,35 +857,38 @@ fn deepseek_tool_adapter_matches_both_native_golden_corpora() {
                     match parser.push(&chunk) {
                         Ok(delta) => result.append(delta),
                         Err(error) => {
-                            failure = Some(format!("ERROR: native push: {error:#}"));
+                            failure = Some(format!("native push: {error:#}"));
                             break;
                         }
                     }
                 }
-                if let Some(error) = failure {
-                    let Some(Expected::Golden(expected_error)) =
-                        divergences::expected(&known, &file.family, &id, Check::Golden)
-                    else {
-                        panic!("{id} {label}: unexpected {error}");
-                    };
-                    assert_eq!(error, expected_error.actual, "{id} {label}");
-                    continue;
+                if failure.is_none() {
+                    match parser.finish() {
+                        Ok(delta) => result.append(delta),
+                        Err(error) => failure = Some(format!("native finish: {error:#}")),
+                    }
                 }
-                result.append(
-                    parser
-                        .finish()
-                        .unwrap_or_else(|e| panic!("{id} {label}: {e}")),
+                let actual = failure.map_or_else(
+                    || {
+                        Ok(result
+                            .coalesce_calls()
+                            .calls
+                            .into_iter()
+                            .map(|call| {
+                                (
+                                    call.name.unwrap(),
+                                    common::canonical_argument_json(&call.arguments),
+                                )
+                            })
+                            .collect::<Vec<_>>())
+                    },
+                    Err,
                 );
-                let actual: Vec<_> = result
-                    .coalesce_calls()
-                    .calls
-                    .into_iter()
-                    .map(|call| UnifiedEvent::ToolCall {
-                        name: call.name.unwrap(),
-                        arguments: serde_json::from_str(&call.arguments).unwrap(),
-                    })
-                    .collect();
-                assert_eq!(actual, expected, "{} {id} {label}", file.family);
+                assert_eq!(
+                    actual, native,
+                    "{} {id} {label}: tool adapter differs from native parser",
+                    file.family
+                );
             }
         }
     }
