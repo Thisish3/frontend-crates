@@ -3,15 +3,15 @@
 
 //! Unified GPT-OSS parser over the incremental Harmony message reader.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::panic::{RefUnwindSafe, UnwindSafe};
 
 use openai_harmony::chat::Role;
 use openai_harmony::{
     HarmonyEncoding, HarmonyEncodingName, StreamableParser, load_harmony_encoding,
 };
-use serde_json::Value;
 
+use crate::tool_calling::arguments::{parsed_json_literal, raw_json_literal};
 use crate::tool_calling::traits::{Result, Tool, ToolCallDelta};
 use crate::unified::{
     GuidedChannel, GuidedGrammar, GuidedReasoning, GuidedRouted, NativeUnified, UnifiedParser,
@@ -92,18 +92,23 @@ fn harmony_encoding() -> Result<&'static HarmonyEncoding> {
         .map_err(|error| anyhow::anyhow!("Harmony encoding unavailable: {error}"))
 }
 
+/// Collected once: `CoreBPE::encode_with_special_tokens` rebuilds this set (~1,090 strings) per call.
+static GLOBAL_HARMONY_SPECIAL_TOKENS: std::sync::OnceLock<HashSet<&'static str>> =
+    std::sync::OnceLock::new();
+
 pub fn encode_harmony(text: &str) -> anyhow::Result<Vec<u32>> {
-    Ok(harmony_encoding()?
-        .tokenizer()
-        .encode_with_special_tokens(text))
+    let encoding = harmony_encoding()?;
+    let special =
+        GLOBAL_HARMONY_SPECIAL_TOKENS.get_or_init(|| encoding.tokenizer().special_tokens());
+    Ok(encoding.tokenizer().encode(text, special).0)
 }
 
 pub fn decode_harmony(token_ids: &[u32]) -> anyhow::Result<String> {
     Ok(harmony_encoding()?.tokenizer().decode_utf8(token_ids)?)
 }
 
-fn token_id(encoding: &HarmonyEncoding, marker: &str) -> Result<u32> {
-    let ids = encoding.tokenizer().encode_with_special_tokens(marker);
+fn token_id(marker: &str) -> Result<u32> {
+    let ids = encode_harmony(marker)?;
     match ids.as_slice() {
         [id] => Ok(*id),
         _ => anyhow::bail!("Harmony marker {marker:?} encoded as {} tokens", ids.len()),
@@ -193,15 +198,15 @@ impl HarmonyRuntime {
     ) -> Result<Self> {
         let mut marker_ids = HashMap::new();
         for marker in CONTROL_MARKERS {
-            marker_ids.insert(token_id(&encoding, marker)?, *marker);
+            marker_ids.insert(token_id(marker)?, *marker);
         }
         Ok(Self {
             parser: StreamableParser::new(encoding.clone(), None)?,
             allow_implicit_channel_header,
             legacy_tool_compatibility,
-            start_id: token_id(&encoding, START)?,
-            message_id: token_id(&encoding, MESSAGE)?,
-            handoff_id: token_id(&encoding, HANDOFF)?,
+            start_id: token_id(START)?,
+            message_id: token_id(MESSAGE)?,
+            handoff_id: token_id(HANDOFF)?,
             encoding,
             marker_ids,
             inside_message: false,
@@ -263,10 +268,7 @@ impl HarmonyRuntime {
             UnifiedParserStartingState::Response => "final",
         };
         let prefix = format!("{START}assistant{CHANNEL}{channel}{MESSAGE}");
-        let ids = self
-            .encoding
-            .tokenizer()
-            .encode_with_special_tokens(&prefix);
+        let ids = encode_harmony(&prefix)?;
         for id in ids {
             self.process_token(id, &mut UnifiedParserOutput::default())?;
         }
@@ -286,7 +288,7 @@ impl HarmonyRuntime {
         }
         let safe = self.text_pending[..safe_len].to_string();
         self.text_pending.drain(..safe_len);
-        let ids = self.encoding.tokenizer().encode_with_special_tokens(&safe);
+        let ids = encode_harmony(&safe)?;
         for id in ids {
             self.process_token(id, output)?;
         }
@@ -399,10 +401,7 @@ impl HarmonyRuntime {
                     || (has_recipient && matches!(marker, Some(MESSAGE | FORMAT))))
             {
                 let pending = std::mem::take(&mut self.outside_pending);
-                let prefix = self
-                    .encoding
-                    .tokenizer()
-                    .encode_with_special_tokens(&format!("{START}assistant"));
+                let prefix = encode_harmony(&format!("{START}assistant"))?;
                 for prefix_id in prefix {
                     self.process_token(prefix_id, output)?;
                 }
@@ -599,7 +598,7 @@ impl HarmonyRuntime {
         tail.content.push_str(&text);
         if complete {
             let candidate = format!("{}{}", self.call_content, tail.content);
-            if serde_json::from_str::<Value>(&candidate).is_ok() {
+            if raw_json_literal(&candidate).is_some() {
                 let tail = self.quoted_control_tail.take().expect("quoted tail exists");
                 for token in tail.tokens {
                     if let Some(marker) = self.marker_ids.get(&token) {
@@ -664,14 +663,20 @@ impl HarmonyRuntime {
         let arguments = if self.call_content.trim().is_empty() {
             "{}".to_string()
         } else {
-            match serde_json::from_str::<Value>(&self.call_content) {
-                Ok(value) if self.legacy_tool_compatibility => {
-                    serde_json::to_string(&value).unwrap_or_else(|_| self.call_content.clone())
+            match raw_json_literal(&self.call_content) {
+                Some(_) if self.legacy_tool_compatibility => {
+                    parsed_json_literal(&self.call_content)
+                        .and_then(|value| value.json_text().ok())
+                        .unwrap_or_else(|| self.call_content.trim().to_string())
                 }
-                Ok(_) => self.call_content.clone(),
-                Err(_) if self.legacy_tool_compatibility => self.call_content.trim().to_string(),
-                Err(error) => {
-                    tracing::warn!(why = "invalid_harmony_tool_arguments", skipped_bytes = self.call_content.len(), error = %error, "discarded malformed Harmony tool arguments");
+                Some(_) => self.call_content.clone(),
+                None if self.legacy_tool_compatibility => self.call_content.trim().to_string(),
+                None => {
+                    tracing::warn!(
+                        why = "invalid_harmony_tool_arguments",
+                        skipped_bytes = self.call_content.len(),
+                        "discarded malformed Harmony tool arguments"
+                    );
                     return;
                 }
             }
@@ -705,10 +710,7 @@ impl HarmonyRuntime {
         }
         if !self.text_pending.is_empty() {
             let pending = std::mem::take(&mut self.text_pending);
-            let ids = self
-                .encoding
-                .tokenizer()
-                .encode_with_special_tokens(&pending);
+            let ids = encode_harmony(&pending)?;
             for id in ids {
                 self.process_token(id, output)?;
             }
@@ -849,7 +851,7 @@ impl HarmonyNative {
         })?;
         let mut marker_ids = HashMap::new();
         for marker in CONTROL_MARKERS {
-            marker_ids.insert(token_id(encoding, marker)?, *marker);
+            marker_ids.insert(token_id(marker)?, *marker);
         }
 
         let mut tail = String::new();
@@ -1376,6 +1378,18 @@ mod tests {
     use crate::unified::{UnifiedEvent, UnifiedParserEvent, UnifiedParserExt};
 
     #[test]
+    fn encode_harmony_matches_encode_with_special_tokens() {
+        let text = "<|start|>assistant<|channel|>analysis<|message|>plan<|reserved_200500|><|end|>";
+        assert_eq!(
+            encode_harmony(text).unwrap(),
+            harmony_encoding()
+                .unwrap()
+                .tokenizer()
+                .encode_with_special_tokens(text)
+        );
+    }
+
+    #[test]
     fn legacy_adapter_matches_routed_native_lifecycle() {
         let input = concat!(
             "<|start|>assistant to=functions.lookup<|channel|>commentary<|message|>",
@@ -1412,6 +1426,40 @@ mod tests {
                 );
                 assert_eq!(legacy.reset(), routed.reset());
             }
+        }
+    }
+
+    #[test]
+    fn legacy_adapter_preserves_exact_nested_number_tokens() {
+        let body = r#"{"z":{"b":1e-400,"a":9007199254740992.5},"a":[4.2e1]}"#;
+        let input = format!(
+            "<|start|>assistant to=functions.lookup<|channel|>commentary<|message|>{body}<|call|>"
+        );
+        let expected = serde_json::to_string(
+            &serde_json::from_str::<serde_json::Value>(
+                r#"{"z":{"b":"TINY","a":"FRACTION"},"a":["EXP"]}"#,
+            )
+            .unwrap(),
+        )
+        .unwrap()
+        .replace("\"TINY\"", "1e-400")
+        .replace("\"FRACTION\"", "9007199254740992.5")
+        .replace("\"EXP\"", "4.2e1");
+        let token_ids = encode_harmony(&input).unwrap();
+
+        for use_tokens in [false, true] {
+            let mut parser = gpt_oss_legacy_tool_adapter();
+            parser.initialize(&[]).unwrap();
+            let mut events = if use_tokens {
+                parser.push_tokens(&token_ids).unwrap()
+            } else {
+                parser.push(&input).unwrap()
+            };
+            events.extend(parser.finish().unwrap().events);
+            assert!(matches!(
+                events.as_slice(),
+                [UnifiedParserEvent::ToolCall(call)] if call.arguments == expected
+            ));
         }
     }
     fn parse_text(
